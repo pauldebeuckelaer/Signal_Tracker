@@ -1,0 +1,7 @@
+.env
+*.db
+*.session
+__pycache__/
+logs/
+positions.json
+scanner_status.json
