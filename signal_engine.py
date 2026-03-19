@@ -166,6 +166,40 @@ def _get_btc_change(conn) -> float:
 
     return (current_price - past_price) / past_price * 100
 
+def _get_orderbook_flow(conn, symbol: str) -> dict:
+    """
+    Get net aggressor flow from orderbook_snapshots for the last 30 minutes.
+    Returns dict with 'flow', 'count', 'latest_time', 'stale'.
+    """
+    try:
+        query = """
+            SELECT snapshot_time, net_aggressor_flow
+            FROM orderbook_snapshots
+            WHERE coin = ?
+              AND snapshot_time > datetime('now', ?)
+            ORDER BY snapshot_time DESC
+        """
+        lookback = f"-{config.OB_FLOW_LOOKBACK_MINUTES} minutes"
+        df = pd.read_sql_query(query, conn, params=(symbol, lookback))
+
+        if df.empty:
+            return {'flow': 0, 'count': 0, 'latest_time': None, 'stale': True}
+
+        df['snapshot_time'] = pd.to_datetime(df['snapshot_time'], utc=True)
+        latest = df['snapshot_time'].max()
+        now = datetime.now(timezone.utc)
+        stale = (now - latest).total_seconds() / 60 > config.OB_FLOW_STALE_MINUTES
+
+        return {
+            'flow': float(df['net_aggressor_flow'].sum()),
+            'count': len(df),
+            'latest_time': latest.isoformat(),
+            'stale': stale,
+        }
+    except Exception as e:
+        log.warning(f"Orderbook flow query error: {e}")
+        return {'flow': 0, 'count': 0, 'latest_time': None, 'stale': True}
+
 
 def get_signal() -> dict:
     """
@@ -227,7 +261,7 @@ def get_signal() -> dict:
         # 3. Get BTC 3h change
         btc_3h = _get_btc_change(conn)
 
-        conn.close()
+
 
         # 4. Evaluate entry conditions
         base_signal = {
@@ -249,6 +283,20 @@ def get_signal() -> dict:
         if rsi >= config.RSI_THRESHOLD:
             return {**base_signal, 'signal_type': 'NONE', 'entry': False,
                     'reason': f'RSI too high ({rsi:.1f} >= {config.RSI_THRESHOLD})'}
+        # ── ORDERBOOK AGGRESSOR FLOW FILTER ──
+        if config.OB_FLOW_ENABLED:
+            ob = _get_orderbook_flow(conn, config.SYMBOL)
+            base_signal['ob_flow'] = round(ob['flow'], 0)
+            base_signal['ob_snapshots'] = ob['count']
+
+            if ob['stale']:
+                log.warning(f"Orderbook data stale (latest: {ob['latest_time']}), skipping filter")
+            elif ob['flow'] < 0:
+                conn.close()
+                return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                        'reason': f"OB flow negative ({ob['flow']:.0f} over {ob['count']} snapshots)"}
+
+        conn.close()
 
         # Base conditions met — check flow for signal type
         if capped_flow < 0:

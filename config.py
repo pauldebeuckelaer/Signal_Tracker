@@ -80,6 +80,14 @@ FLOW_CAP_USD = 5000                   # cap per address per bin
 FLOW_LOOKBACK_HOURS = 6               # hours of order data for flow calc
 
 # ─────────────────────────────────────────────
+# ORDERBOOK AGGRESSOR FLOW FILTER
+# ─────────────────────────────────────────────
+
+OB_FLOW_ENABLED = True                # enable orderbook flow filter
+OB_FLOW_LOOKBACK_MINUTES = 30         # sum last 30 min of net_aggressor_flow
+OB_FLOW_STALE_MINUTES = 5             # if data older than this, skip filter (don't block)
+
+# ─────────────────────────────────────────────
 # CANDLE CONSTRUCTION
 # ─────────────────────────────────────────────
 
