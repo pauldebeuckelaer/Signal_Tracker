@@ -33,8 +33,9 @@ def get_connection():
 
 def _build_candles(conn, symbol: str, lookback_hours: int = 30) -> pd.DataFrame:
     """
-    Build 30-minute OHLCV candles from snapshots table.
+    Build 30-minute OHLCV candles from snapshots table (whale tracker).
     Includes buy_volume, sell_volume for vol_imbalance calculation.
+    Used for HYPE (full strategy) where VI is needed.
     """
     query = """
         SELECT timestamp, price, buy_volume, sell_volume, unique_addresses
@@ -66,6 +67,42 @@ def _build_candles(conn, symbol: str, lookback_hours: int = 30) -> pd.DataFrame:
     candles = candles[candles['tick_count'] >= config.SNAPSHOT_MIN_TICKS]
 
     return candles.reset_index()
+
+
+def _build_candles_market(conn, symbol: str, lookback_hours: int = 30) -> pd.DataFrame:
+    """
+    Build 30-minute OHLC candles from market_snapshots table.
+    Used for simple strategy coins (VVV, NEAR, PURR) where VI is not needed.
+    market_snapshots has 1-min resolution for ALL coins — always fresh.
+    """
+    query = """
+        SELECT snapshot_time, mark_px
+        FROM market_snapshots
+        WHERE coin = ?
+          AND snapshot_time > datetime('now', ?)
+        ORDER BY snapshot_time
+    """
+    df = pd.read_sql_query(query, conn, params=(symbol, f"-{lookback_hours} hours"))
+
+    if df.empty:
+        log.warning(f"No market_snapshot data for {symbol} in last {lookback_hours}h")
+        return pd.DataFrame()
+
+    df['snapshot_time'] = pd.to_datetime(df['snapshot_time'], utc=True)
+    df = df.set_index('snapshot_time')
+
+    candles = df.resample('30min').agg(
+        open=('mark_px', 'first'),
+        high=('mark_px', 'max'),
+        low=('mark_px', 'min'),
+        close=('mark_px', 'last'),
+        tick_count=('mark_px', 'count'),
+    ).dropna(subset=['close'])
+
+    # At 1-min snapshots, expect ~30 ticks per 30-min candle
+    candles = candles[candles['tick_count'] >= config.SNAPSHOT_MIN_TICKS]
+
+    return candles.reset_index().rename(columns={'snapshot_time': 'timestamp'})
 
 
 def _add_indicators(candles: pd.DataFrame, rsi_period: int = 14) -> pd.DataFrame:
@@ -179,14 +216,15 @@ def _get_orderbook_flow(conn, symbol: str, coin_cfg: dict) -> dict:
 
 def _get_btc_change(conn) -> float:
     """
-    Get BTC 3-hour price change (%) from snapshots.
+    Get BTC 3-hour price change (%) from market_snapshots.
+    Uses market_snapshots (1-min, always fresh) instead of snapshots.
     """
     query = """
-        SELECT timestamp, price
-        FROM snapshots
-        WHERE symbol = 'BTC'
-          AND timestamp > datetime('now', '-4 hours')
-        ORDER BY timestamp
+        SELECT snapshot_time, mark_px
+        FROM market_snapshots
+        WHERE coin = 'BTC'
+          AND snapshot_time > datetime('now', '-4 hours')
+        ORDER BY snapshot_time
     """
     df = pd.read_sql_query(query, conn)
 
@@ -194,16 +232,16 @@ def _get_btc_change(conn) -> float:
         log.warning("Not enough BTC data for 3h change")
         return 0.0
 
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    df['snapshot_time'] = pd.to_datetime(df['snapshot_time'], utc=True)
 
-    current_price = df['price'].iloc[-1]
-    target_time = df['timestamp'].iloc[-1] - timedelta(hours=3)
-    past_df = df[df['timestamp'] <= target_time]
+    current_price = df['mark_px'].iloc[-1]
+    target_time = df['snapshot_time'].iloc[-1] - timedelta(hours=3)
+    past_df = df[df['snapshot_time'] <= target_time]
 
     if past_df.empty:
-        past_price = df['price'].iloc[0]
+        past_price = df['mark_px'].iloc[0]
     else:
-        past_price = past_df['price'].iloc[-1]
+        past_price = past_df['mark_px'].iloc[-1]
 
     if past_price <= 0:
         return 0.0
@@ -229,8 +267,13 @@ def get_signal_for_coin(coin_cfg: dict) -> dict:
     try:
         conn = get_connection()
 
-        # 1. Build candles with indicators
-        candles = _build_candles(conn, symbol, lookback_hours=30)
+        # 1. Build candles — use snapshots for full strategy (has volume data),
+        #    market_snapshots for simple strategy (always fresh, all coins)
+        if strategy == "full":
+            candles = _build_candles(conn, symbol, lookback_hours=30)
+        else:
+            candles = _build_candles_market(conn, symbol, lookback_hours=30)
+
         rsi_period = coin_cfg.get('rsi_period', 14)
 
         if candles.empty or len(candles) < rsi_period + 5:
