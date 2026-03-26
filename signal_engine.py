@@ -113,8 +113,11 @@ def _add_indicators(candles: pd.DataFrame, rsi_period: int = 14) -> pd.DataFrame
         log.warning(f"Not enough candles for indicators: {len(d)}")
         return d
 
-    # Vol imbalance
-    d['vol_imbalance'] = (d['buy_volume'] - d['sell_volume']) / (d['buy_volume'] + d['sell_volume'] + 1)
+    # Vol imbalance (only if volume data available — snapshots table, not market_snapshots)
+    if 'buy_volume' in d.columns and 'sell_volume' in d.columns:
+        d['vol_imbalance'] = (d['buy_volume'] - d['sell_volume']) / (d['buy_volume'] + d['sell_volume'] + 1)
+    else:
+        d['vol_imbalance'] = 0.0
 
     # RSI
     delta = d['close'].diff()
