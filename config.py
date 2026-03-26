@@ -1,14 +1,12 @@
 """
-Combined Strategy Bot — Configuration
-=======================================
-VI + RSI dip buyer with contrarian whale flow filter + BTC risk-off gate.
+Multi-Coin Signal Tracker — Configuration
+===========================================
+Per-coin strategies with shared infrastructure.
 
-Strategy logic:
-  1. VI > 0.3 AND RSI(14) < 40 → potential entry
-  2. If capped_flow < 0 → ENTER (contrarian, highest conviction)
-  3. If capped_flow >= 0 AND BTC 3h change > -2% → ENTER (baseline + BTC gate)
-  4. If capped_flow >= 0 AND BTC 3h change <= -2% → SKIP
-  5. Exit: TP=1.5%, SL=2.0%, MaxHold=12 bars (6 hours)
+HYPE:  VI + RSI + contrarian flow + BTC gate + OB filter  (full stack)
+VVV:   RSI + BTC gate                                     (simple dip buyer)
+NEAR:  RSI + BTC gate                                     (simple dip buyer)
+PURR:  RSI + BTC gate                                     (simple dip buyer)
 """
 
 import os
@@ -20,79 +18,135 @@ load_dotenv()
 # DATABASE
 # ─────────────────────────────────────────────
 
-# GCP path:
 DB_PATH = os.getenv("DB_PATH", "/home/pauldb46/Hyperliquid_TWAP_Tracker/data/twap.db")
-# Local path:
-#DB_PATH = os.getenv("DB_PATH", r"C:/Users/paul_/PycharmProjects/Hyperliquid_TWAP_Analyzer/data/twap.db")
 
 # ─────────────────────────────────────────────
 # TIMING
 # ─────────────────────────────────────────────
 
-SIGNAL_CHECK_SECONDS = 60             # check for new signal every 60s
-POSITION_CHECK_SECONDS = 30           # manage positions every 30s
-CANDLE_FREQ_MINUTES = 30              # 30-minute candles
+SIGNAL_CHECK_SECONDS = 60
+POSITION_CHECK_SECONDS = 30
+CANDLE_FREQ_MINUTES = 30
 
 # ─────────────────────────────────────────────
-# TRADING PAIR
+# EXECUTION (GLOBAL)
 # ─────────────────────────────────────────────
 
-SYMBOL = "HYPE"
-BTC_SYMBOL = "BTC"
-
-# ─────────────────────────────────────────────
-# EXECUTION
-# ─────────────────────────────────────────────
-
-MAX_POSITIONS = 1                     # one position at a time
+MAX_POSITIONS = 4                     # max 4 concurrent across all coins
 FIXED_POSITION_USD = 12.50            # $12.50 per trade
 
 # ─────────────────────────────────────────────
-# SIGNAL PARAMETERS (validated via backtest)
+# BTC GATE (shared across all coins)
 # ─────────────────────────────────────────────
 
-# Entry conditions
-VI_THRESHOLD = 0.3                    # vol_imbalance > 0.3
-RSI_THRESHOLD = 40                    # RSI(14) < 40
-RSI_PERIOD = 14                       # RSI lookback
-
-# Contrarian flow (priority entry)
-# When flow < 0 AND VI+RSI met → enter regardless of BTC
-# No additional threshold needed — any negative flow qualifies
-
-# BTC risk-off gate (baseline entry only)
-BTC_3H_CHANGE_MIN = -2.0             # BTC 3h change must be > -2%
-BTC_LOOKBACK_BARS = 6                # 6 x 30min = 3 hours
+BTC_SYMBOL = "BTC"
+BTC_3H_CHANGE_MIN = -2.0
+BTC_LOOKBACK_BARS = 6                 # 6 x 30min = 3 hours
 
 # ─────────────────────────────────────────────
-# EXIT PARAMETERS (validated via TP/SL sweep)
+# CANDLE CONSTRUCTION (shared)
 # ─────────────────────────────────────────────
 
-TP_PCT = 1.5                          # take profit at +1.5%
-SL_PCT = 2.0                          # stop loss at -2.0%
-MAX_HOLD_BARS = 12                    # max hold = 12 x 30min = 6 hours
+CANDLE_LOOKBACK_BARS = 50
+SNAPSHOT_MIN_TICKS = 10
 
 # ─────────────────────────────────────────────
-# CAPPED FLOW CALCULATION
+# PER-COIN CONFIGURATIONS
 # ─────────────────────────────────────────────
+# Each coin dict contains all parameters specific to that coin.
+# strategy_type:
+#   "full"   = VI + RSI + contrarian flow + BTC gate + OB filter (HYPE)
+#   "simple" = RSI + BTC gate only (VVV, NEAR, PURR)
 
-FLOW_CAP_USD = 5000                   # cap per address per bin
-FLOW_LOOKBACK_HOURS = 6               # hours of order data for flow calc
+COIN_CONFIGS = {
+    "HYPE": {
+        "symbol": "HYPE",
+        "strategy_type": "full",
+        "enabled": True,
+
+        # Signal parameters
+        "rsi_period": 14,
+        "rsi_threshold": 40,          # RSI < 40
+        "vi_threshold": 0.3,          # VI > 0.3 (full strategy only)
+
+        # Exit parameters
+        "tp_pct": 1.5,
+        "sl_pct": 2.0,
+        "max_hold_bars": 12,          # 12 x 30min = 6 hours
+
+        # Capped flow (full strategy only)
+        "flow_cap_usd": 5000,
+        "flow_lookback_hours": 6,
+
+        # Orderbook flow filter (full strategy only)
+        "ob_flow_enabled": True,
+        "ob_flow_lookback_minutes": 30,
+        "ob_flow_stale_minutes": 5,
+    },
+
+    "VVV": {
+        "symbol": "VVV",
+        "strategy_type": "simple",
+        "enabled": True,
+
+        "rsi_period": 14,
+        "rsi_threshold": 40,          # RSI < 40
+
+        "tp_pct": 3.0,
+        "sl_pct": 3.0,
+        "max_hold_bars": 6,           # 6 x 30min = 3 hours
+    },
+
+    "NEAR": {
+        "symbol": "NEAR",
+        "strategy_type": "simple",
+        "enabled": True,
+
+        "rsi_period": 14,
+        "rsi_threshold": 35,          # RSI < 35 (tighter)
+
+        "tp_pct": 1.5,
+        "sl_pct": 1.0,
+        "max_hold_bars": 6,           # 6 x 30min = 3 hours
+    },
+
+    "PURR": {
+        "symbol": "PURR",
+        "strategy_type": "simple",
+        "enabled": True,
+
+        "rsi_period": 14,
+        "rsi_threshold": 40,          # RSI < 40
+
+        "tp_pct": 3.0,
+        "sl_pct": 3.0,
+        "max_hold_bars": 24,          # 24 x 30min = 12 hours
+    },
+}
+
+# Helper to get list of enabled coins
+ENABLED_COINS = [sym for sym, cfg in COIN_CONFIGS.items() if cfg.get("enabled")]
 
 # ─────────────────────────────────────────────
-# ORDERBOOK AGGRESSOR FLOW FILTER
+# LEGACY SINGLE-COIN REFERENCES
 # ─────────────────────────────────────────────
+# Kept for backward compat with executor/database
+# that still reference config.SYMBOL, config.TP_PCT etc.
+# These default to HYPE but shouldn't be used for
+# multi-coin logic — use COIN_CONFIGS[symbol] instead.
 
-OB_FLOW_ENABLED = True                # enable orderbook flow filter
-OB_FLOW_LOOKBACK_MINUTES = 30         # sum last 30 min of net_aggressor_flow
-OB_FLOW_STALE_MINUTES = 5             # if data older than this, skip filter (don't block)
-
-# ─────────────────────────────────────────────
-# CANDLE CONSTRUCTION
-# ─────────────────────────────────────────────
-
-CANDLE_LOOKBACK_BARS = 50             # need ~50 bars for RSI(14) warmup
-SNAPSHOT_MIN_TICKS = 10               # minimum ticks per candle (50% of 30min ≈ 15)
+SYMBOL = "HYPE"
+VI_THRESHOLD = 0.3
+RSI_THRESHOLD = 40
+RSI_PERIOD = 14
+TP_PCT = 1.5
+SL_PCT = 2.0
+MAX_HOLD_BARS = 12
+FLOW_CAP_USD = 5000
+FLOW_LOOKBACK_HOURS = 6
+OB_FLOW_ENABLED = True
+OB_FLOW_LOOKBACK_MINUTES = 30
+OB_FLOW_STALE_MINUTES = 5
 
 # ─────────────────────────────────────────────
 # EXCHANGE CREDENTIALS (from .env)

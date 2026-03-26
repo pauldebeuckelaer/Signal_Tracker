@@ -1,17 +1,17 @@
 """
-Combined Strategy Bot — Main Entry Point
-==========================================
-VI + RSI dip buyer with contrarian flow priority + BTC risk-off gate.
+Multi-Coin Signal Tracker — Main Entry Point
+==============================================
+Trades HYPE (full VI+flow strategy) + VVV, NEAR, PURR (RSI dip buyers).
 
 30-second loop with two rhythms:
-  - Every 30s: manage position (TP/SL/time exit)
-  - Every 30min: check for new entry signal
+  - Every 30s: manage positions (per-coin TP/SL/time exit)
+  - Every 30min: check all enabled coins for entry signals
 
-Backtested: 53 trades, 73.6% WR, +33.56%, PF 2.65, 7/7 positive weeks.
+Max 4 concurrent positions, $12.50 each.
 
 Usage:
-    python3 main_combined.py
-    nohup python3 main_combined.py > /dev/null 2>&1 &
+    python3 main_signaltracker.py
+    nohup python3 main_signaltracker.py > /dev/null 2>&1 &
 """
 
 import time
@@ -19,7 +19,7 @@ from datetime import datetime, timezone
 
 import config
 from utils import log, save_positions, load_positions, save_status
-from signal_engine import get_signal
+from signal_engine import get_signal_for_coin
 from storage.database import init_db, record_entry, record_exit
 from telegram import alerts
 import executor
@@ -31,7 +31,8 @@ import executor
 
 def check_exit_conditions():
     """
-    Check TP, SL, and max hold time for the active position.
+    Check TP, SL, and max hold time for all active positions.
+    Uses per-coin exit parameters from COIN_CONFIGS.
     Called every 30 seconds.
     """
     positions = executor.get_positions()
@@ -59,94 +60,122 @@ def check_exit_conditions():
         # PnL (long only)
         pnl_pct = (price - entry_price) / entry_price * 100
 
+        # Get per-coin exit parameters
+        coin_cfg = config.COIN_CONFIGS.get(symbol, {})
+        tp_pct = coin_cfg.get('tp_pct', config.TP_PCT)
+        sl_pct = coin_cfg.get('sl_pct', config.SL_PCT)
+        max_hold_bars = coin_cfg.get('max_hold_bars', config.MAX_HOLD_BARS)
+        max_hold_minutes = max_hold_bars * config.CANDLE_FREQ_MINUTES
+
         # ── TAKE PROFIT ──
-        if pnl_pct >= config.TP_PCT:
-            executor.close_position(symbol, f"TP hit: {pnl_pct:+.2f}% >= {config.TP_PCT}%")
+        if pnl_pct >= tp_pct:
+            executor.close_position(symbol, f"TP hit: {pnl_pct:+.2f}% >= {tp_pct}%")
             continue
 
         # ── STOP LOSS ──
-        if pnl_pct <= -config.SL_PCT:
-            executor.close_position(symbol, f"SL hit: {pnl_pct:+.2f}% <= -{config.SL_PCT}%")
+        if pnl_pct <= -sl_pct:
+            executor.close_position(symbol, f"SL hit: {pnl_pct:+.2f}% <= -{sl_pct}%")
             continue
 
         # ── MAX HOLD TIME ──
         entry_time = datetime.fromisoformat(pos['entry_time'])
         now = datetime.now(timezone.utc)
         hold_minutes = (now - entry_time).total_seconds() / 60
-        max_hold_minutes = config.MAX_HOLD_BARS * config.CANDLE_FREQ_MINUTES
 
         if hold_minutes >= max_hold_minutes:
-            executor.close_position(symbol, f"TIME exit: held {hold_minutes:.0f}min (max {max_hold_minutes}min), PnL={pnl_pct:+.2f}%")
+            executor.close_position(symbol,
+                f"TIME exit: held {hold_minutes:.0f}min (max {max_hold_minutes}min), PnL={pnl_pct:+.2f}%")
             continue
 
     save_positions(executor.get_positions())
 
 
 # ─────────────────────────────────────────────
-# SIGNAL CHECK & ENTRY
+# SIGNAL CHECK & ENTRY (MULTI-COIN)
 # ─────────────────────────────────────────────
 
-def check_for_entry():
+def check_all_coins():
     """
-    Check the combined signal and enter if conditions are met.
+    Check signals for all enabled coins and enter where conditions are met.
     Called once per 30-min candle close.
     """
-    # Already in a position?
-    if not executor.can_open():
-        log.info("Position open, skipping signal check")
-        return
+    for symbol in config.ENABLED_COINS:
+        coin_cfg = config.COIN_CONFIGS[symbol]
 
-    # Get the signal
-    signal = get_signal()
+        # Skip if already in this coin
+        if executor.has_position(symbol):
+            log.info(f"[{symbol}] Already in position, skipping")
+            continue
 
-    # Log the signal regardless
-    log.info(f"SIGNAL | {signal['signal_type']:>8} | VI={signal['vi']:.3f} RSI={signal['rsi']:.1f} "
-             f"flow={signal['capped_flow']:+.0f} whales={signal['unique_whales']} "
-             f"BTC_3h={signal['btc_3h_change']:+.2f}% | ${signal['price']:.4f} | {signal['reason']}")
+        # Skip if max positions reached
+        if not executor.can_open():
+            log.info(f"[{symbol}] Max positions ({config.MAX_POSITIONS}) reached, skipping")
+            break  # no point checking remaining coins
 
-    if not signal['entry']:
-        save_status({
-            'last_signal': signal,
-            'positions': len(executor.get_positions()),
-            'timestamp': datetime.now(timezone.utc).isoformat(),
-        })
-        return
+        # Get signal for this coin
+        signal = get_signal_for_coin(coin_cfg)
 
-    # ── ENTER ──
-    log.info(f">> ENTERING: {signal['reason']}")
+        # Log regardless of entry
+        _log_signal(signal, coin_cfg)
 
-    # Build signal dict compatible with executor.open_position
-    entry_signal = {
-        'price': signal['price'],
-        'cf_z': signal['capped_flow'],  # repurpose field for flow value
-        'unique_addresses': signal['unique_whales'],
-    }
+        if not signal['entry']:
+            continue
 
-    success = executor.open_position(
-        symbol=config.SYMBOL,
-        direction='long',
-        signal=entry_signal,
-    )
+        # ── ENTER ──
+        log.info(f"[{symbol}] >> ENTERING: {signal['reason']}")
 
-    if success:
-        # Store extra metadata on the position
-        positions = executor.get_positions()
-        for pos in positions:
-            if pos['symbol'] == config.SYMBOL:
-                pos['signal_type'] = signal['signal_type']
-                pos['entry_vi'] = signal['vi']
-                pos['entry_rsi'] = signal['rsi']
-                pos['entry_flow'] = signal['capped_flow']
-                pos['entry_btc_3h'] = signal['btc_3h_change']
-                break
-        save_positions(positions)
+        entry_signal = {
+            'price': signal['price'],
+            'cf_z': signal.get('capped_flow', 0),
+            'unique_addresses': signal.get('unique_whales', 0),
+        }
 
+        success = executor.open_position(
+            symbol=symbol,
+            direction='long',
+            signal=entry_signal,
+        )
+
+        if success:
+            # Store extra metadata on the position
+            positions = executor.get_positions()
+            for pos in positions:
+                if pos['symbol'] == symbol:
+                    pos['signal_type'] = signal['signal_type']
+                    pos['entry_vi'] = signal.get('vi', 0)
+                    pos['entry_rsi'] = signal['rsi']
+                    pos['entry_flow'] = signal.get('capped_flow', 0)
+                    pos['entry_btc_3h'] = signal['btc_3h_change']
+                    pos['strategy_type'] = coin_cfg['strategy_type']
+                    break
+            save_positions(positions)
+
+    # Save status after checking all coins
     save_status({
-        'last_signal': signal,
-        'last_entry': success,
+        'coins_checked': config.ENABLED_COINS,
         'positions': len(executor.get_positions()),
+        'open_symbols': [p['symbol'] for p in executor.get_positions()],
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
+
+
+def _log_signal(signal: dict, coin_cfg: dict):
+    """Log signal details in a consistent format."""
+    symbol = signal['symbol']
+    strategy = coin_cfg['strategy_type']
+
+    if strategy == "full":
+        log.info(f"[{symbol}] {signal['signal_type']:>8} | "
+                 f"VI={signal['vi']:.3f} RSI={signal['rsi']:.1f} "
+                 f"flow={signal.get('capped_flow', 0):+.0f} "
+                 f"whales={signal.get('unique_whales', 0)} "
+                 f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
+                 f"${signal['price']:.4f} | {signal['reason']}")
+    else:
+        log.info(f"[{symbol}] {signal['signal_type']:>8} | "
+                 f"RSI={signal['rsi']:.1f} "
+                 f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
+                 f"${signal['price']:.4f} | {signal['reason']}")
 
 
 # ─────────────────────────────────────────────
@@ -160,7 +189,6 @@ def _is_candle_close() -> bool:
     """
     now = datetime.now(timezone.utc)
     minute = now.minute
-    # Within 2 minutes of :00 or :30
     return minute <= 2 or (30 <= minute <= 32)
 
 
@@ -174,22 +202,24 @@ def _should_check_signal() -> bool:
         return False
 
     now = datetime.now(timezone.utc)
-    # Round to current 30-min boundary
     candle_key = now.strftime('%Y-%m-%d %H:') + ('00' if now.minute < 30 else '30')
 
     if candle_key == _last_candle_check:
-        return False  # Already checked this candle
+        return False
 
     _last_candle_check = candle_key
     return True
 
 
 # ─────────────────────────────────────────────
-# HEARTBEAT
+# HEARTBEAT (LOG + TELEGRAM)
 # ─────────────────────────────────────────────
 
+TELEGRAM_HEARTBEAT_SECONDS = 2 * 60 * 60  # 2 hours
+_last_telegram_heartbeat = None
+
 def log_heartbeat():
-    """Log position status."""
+    """Log all open positions to file."""
     positions = executor.get_positions()
     if not positions:
         return
@@ -202,9 +232,65 @@ def log_heartbeat():
             entry_time = datetime.fromisoformat(pos['entry_time'])
             hold_min = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
 
-            log.info(f"POS | {pos.get('signal_type', '?'):>8} | "
-                     f"LONG {pos['size']:.4f} {pos['symbol']} @ ${pos['entry_price']:.4f} "
-                     f"→ ${price:.4f} | PnL: {pnl:+.2f}% | Hold: {hold_min:.0f}min")
+            coin_cfg = config.COIN_CONFIGS.get(pos['symbol'], {})
+            tp = coin_cfg.get('tp_pct', '?')
+            sl = coin_cfg.get('sl_pct', '?')
+
+            log.info(f"POS [{pos['symbol']}] | {pos.get('signal_type', '?'):>8} | "
+                     f"LONG {pos['size']:.4f} @ ${pos['entry_price']:.4f} "
+                     f"→ ${price:.4f} | PnL: {pnl:+.2f}% | Hold: {hold_min:.0f}min "
+                     f"| TP={tp}% SL={sl}%")
+
+
+def telegram_heartbeat():
+    """
+    Send position update via Telegram every 2 hours.
+    Only sends if there are open positions.
+    """
+    global _last_telegram_heartbeat
+
+    positions = executor.get_positions()
+    if not positions:
+        _last_telegram_heartbeat = None  # reset so next open triggers immediately
+        return
+
+    now = datetime.now(timezone.utc)
+
+    # Check if 2 hours have passed since last Telegram heartbeat
+    if _last_telegram_heartbeat is not None:
+        elapsed = (now - _last_telegram_heartbeat).total_seconds()
+        if elapsed < TELEGRAM_HEARTBEAT_SECONDS:
+            return
+
+    _last_telegram_heartbeat = now
+
+    # Build the message
+    client = executor.get_client()
+    lines = [f"📊 Position Update ({len(positions)} open)"]
+
+    for pos in positions:
+        price = _get_price(client, pos['symbol'])
+        if not price or not pos['entry_price']:
+            lines.append(f"\n{pos['symbol']}: price unavailable")
+            continue
+
+        pnl = (price - pos['entry_price']) / pos['entry_price'] * 100
+        entry_time = datetime.fromisoformat(pos['entry_time'])
+        hold_min = (now - entry_time).total_seconds() / 60
+
+        coin_cfg = config.COIN_CONFIGS.get(pos['symbol'], {})
+        tp = coin_cfg.get('tp_pct', '?')
+        sl = coin_cfg.get('sl_pct', '?')
+        max_hold = coin_cfg.get('max_hold_bars', 0) * config.CANDLE_FREQ_MINUTES
+
+        emoji = "🟢" if pnl >= 0 else "🔴"
+        lines.append(
+            f"\n{emoji} {pos['symbol']} | {pos.get('signal_type', '?')}"
+            f"\n   ${pos['entry_price']:.4f} → ${price:.4f} ({pnl:+.2f}%)"
+            f"\n   Hold: {hold_min:.0f}/{max_hold}min | TP={tp}% SL={sl}%"
+        )
+
+    alerts.send("\n".join(lines))
 
 
 # ─────────────────────────────────────────────
@@ -228,15 +314,25 @@ def _get_price(client, symbol: str):
 
 def main():
     log.info("=" * 85)
-    log.info("Combined Strategy Bot v1.0")
-    log.info(f"Strategy: VI>{config.VI_THRESHOLD} + RSI<{config.RSI_THRESHOLD} "
-             f"| Contrarian priority + BTC gate")
-    log.info(f"Pair: {config.SYMBOL} | Size: ${config.FIXED_POSITION_USD}")
-    log.info(f"Exit: TP={config.TP_PCT}% SL={config.SL_PCT}% "
-             f"MaxHold={config.MAX_HOLD_BARS} bars ({config.MAX_HOLD_BARS * config.CANDLE_FREQ_MINUTES}min)")
+    log.info("Multi-Coin Signal Tracker v2.0")
+    log.info(f"Coins: {', '.join(config.ENABLED_COINS)}")
+    log.info(f"Max positions: {config.MAX_POSITIONS} | Size: ${config.FIXED_POSITION_USD} each")
     log.info(f"BTC risk-off gate: 3h change > {config.BTC_3H_CHANGE_MIN}%")
     log.info(f"Candle freq: {config.CANDLE_FREQ_MINUTES}min | "
              f"Position check: {config.POSITION_CHECK_SECONDS}s")
+    log.info("-" * 85)
+    for sym in config.ENABLED_COINS:
+        cfg = config.COIN_CONFIGS[sym]
+        strategy = cfg['strategy_type']
+        if strategy == "full":
+            log.info(f"  {sym:6s} | {strategy:6s} | VI>{cfg['vi_threshold']} RSI<{cfg['rsi_threshold']} "
+                     f"| TP={cfg['tp_pct']}% SL={cfg['sl_pct']}% "
+                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min) "
+                     f"| OB={cfg.get('ob_flow_enabled', False)}")
+        else:
+            log.info(f"  {sym:6s} | {strategy:6s} | RSI<{cfg['rsi_threshold']} "
+                     f"| TP={cfg['tp_pct']}% SL={cfg['sl_pct']}% "
+                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min)")
     log.info("=" * 85)
 
     # Initialize
@@ -244,8 +340,8 @@ def main():
     executor.init()
 
     # Run initial signal check
-    log.info("Running initial signal check...")
-    check_for_entry()
+    log.info("Running initial signal check for all coins...")
+    check_all_coins()
 
     heartbeat_counter = 0
 
@@ -253,19 +349,22 @@ def main():
         try:
             heartbeat_counter += 1
 
-            # Every 30s: check exits (TP/SL/time)
+            # Every 30s: check exits (TP/SL/time) for all open positions
             check_exit_conditions()
 
-            # At candle close: check for new entry
+            # At candle close: check all coins for new entries
             if _should_check_signal():
                 log.info("─" * 60)
                 log.info(f"CANDLE CLOSE | {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
-                check_for_entry()
+                check_all_coins()
 
-            # Heartbeat every 5 minutes (10 x 30s)
+            # Heartbeat every 5 minutes (10 x 30s) — log only
             if heartbeat_counter >= 10:
                 log_heartbeat()
                 heartbeat_counter = 0
+
+            # Telegram heartbeat every 2 hours (if positions open)
+            telegram_heartbeat()
 
         except Exception as e:
             log.error(f"Loop error: {e}", exc_info=True)
