@@ -4,7 +4,7 @@ Multi-Coin Signal Tracker — Signal Engine
 Two strategy types:
 
   "full"   (HYPE):  VI + RSI + contrarian flow + BTC gate + OB filter
-  "simple" (others): RSI + BTC gate only
+  "simple" (others): RSI + BTC gate + OB flow filter
 
 All strategies share:
   - 30min candles built from twap.db snapshots
@@ -180,13 +180,14 @@ def _build_capped_flow(conn, symbol: str, coin_cfg: dict) -> pd.DataFrame:
 def _get_orderbook_flow(conn, symbol: str, coin_cfg: dict) -> dict:
     """
     Get net aggressor flow from orderbook_snapshots for the last N minutes.
+    Returns flow sum, snapshot count, total trades, and staleness.
     """
     lookback = coin_cfg.get('ob_flow_lookback_minutes', 30)
     stale_minutes = coin_cfg.get('ob_flow_stale_minutes', 5)
 
     try:
         query = """
-            SELECT snapshot_time, net_aggressor_flow
+            SELECT snapshot_time, net_aggressor_flow, num_trades
             FROM orderbook_snapshots
             WHERE coin = ?
               AND snapshot_time > datetime('now', ?)
@@ -195,7 +196,7 @@ def _get_orderbook_flow(conn, symbol: str, coin_cfg: dict) -> dict:
         df = pd.read_sql_query(query, conn, params=(symbol, f"-{lookback} minutes"))
 
         if df.empty:
-            return {'flow': 0, 'count': 0, 'latest_time': None, 'stale': True}
+            return {'flow': 0, 'count': 0, 'total_trades': 0, 'latest_time': None, 'stale': True}
 
         df['snapshot_time'] = pd.to_datetime(df['snapshot_time'], utc=True)
         latest = df['snapshot_time'].max()
@@ -205,12 +206,13 @@ def _get_orderbook_flow(conn, symbol: str, coin_cfg: dict) -> dict:
         return {
             'flow': float(df['net_aggressor_flow'].sum()),
             'count': len(df),
+            'total_trades': int(df['num_trades'].sum()),
             'latest_time': latest.isoformat(),
             'stale': stale,
         }
     except Exception as e:
         log.warning(f"Orderbook flow query error for {symbol}: {e}")
-        return {'flow': 0, 'count': 0, 'latest_time': None, 'stale': True}
+        return {'flow': 0, 'count': 0, 'total_trades': 0, 'latest_time': None, 'stale': True}
 
 
 # ─────────────────────────────────────────────
@@ -314,7 +316,7 @@ def get_signal_for_coin(coin_cfg: dict) -> dict:
         if strategy == "full":
             result = _evaluate_full(conn, candles, base_signal, coin_cfg)
         else:
-            result = _evaluate_simple(base_signal, coin_cfg)
+            result = _evaluate_simple(conn, base_signal, coin_cfg)
 
         conn.close()
         return result
@@ -370,6 +372,7 @@ def _evaluate_full(conn, candles, base_signal: dict, coin_cfg: dict) -> dict:
         ob = _get_orderbook_flow(conn, symbol, coin_cfg)
         base_signal['ob_flow'] = round(ob['flow'], 0)
         base_signal['ob_snapshots'] = ob['count']
+        base_signal['ob_trades'] = ob['total_trades']
 
         if ob['stale']:
             log.warning(f"Orderbook data stale for {symbol} (latest: {ob['latest_time']}), skipping filter")
@@ -394,10 +397,15 @@ def _evaluate_full(conn, candles, base_signal: dict, coin_cfg: dict) -> dict:
                     'reason': f'BTC risk-off (3h={btc_3h:+.2f}% <= {config.BTC_3H_CHANGE_MIN}%)'}
 
 
-def _evaluate_simple(base_signal: dict, coin_cfg: dict) -> dict:
+def _evaluate_simple(conn, base_signal: dict, coin_cfg: dict) -> dict:
     """
     Simple strategy evaluation (VVV, NEAR, PURR).
-    RSI < threshold + BTC gate only.
+    RSI < threshold + BTC gate + OB flow filter.
+
+    OB flow filter checks:
+      1. Data is not stale
+      2. Net aggressor flow > ob_min_net_flow (coin-calibrated)
+      3. Total trades in lookback > ob_min_trades
     """
     symbol = coin_cfg['symbol']
     rsi = base_signal['rsi']
@@ -414,9 +422,37 @@ def _evaluate_simple(base_signal: dict, coin_cfg: dict) -> dict:
         return {**base_signal, 'signal_type': 'NONE', 'entry': False,
                 'reason': f'BTC risk-off (3h={btc_3h:+.2f}% <= {config.BTC_3H_CHANGE_MIN}%)'}
 
+    # ── OB FLOW FILTER (new) ──
+    if coin_cfg.get('ob_flow_enabled', False):
+        ob = _get_orderbook_flow(conn, symbol, coin_cfg)
+        base_signal['ob_flow'] = round(ob['flow'], 0)
+        base_signal['ob_snapshots'] = ob['count']
+        base_signal['ob_trades'] = ob['total_trades']
+
+        min_net_flow = coin_cfg.get('ob_min_net_flow', 0)
+        min_trades = coin_cfg.get('ob_min_trades', 0)
+
+        if ob['stale']:
+            log.warning(f"[{symbol}] OB data stale (latest: {ob['latest_time']}), blocking entry")
+            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                    'reason': f"OB data stale (latest: {ob['latest_time']})"}
+
+        # Check minimum trade activity — is anyone even trading?
+        if ob['total_trades'] < min_trades:
+            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                    'reason': f"OB too quiet ({ob['total_trades']} trades < {min_trades} min in {coin_cfg.get('ob_flow_lookback_minutes', 30)}min)"}
+
+        # Check net aggressor flow — are buyers stepping in?
+        if ob['flow'] < min_net_flow:
+            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                    'reason': f"OB flow too weak ({ob['flow']:.0f} < {min_net_flow} min in {coin_cfg.get('ob_flow_lookback_minutes', 30)}min)"}
+
+        log.info(f"[{symbol}] OB flow OK: {ob['flow']:.0f} (>={min_net_flow}), "
+                 f"trades={ob['total_trades']} (>={min_trades})")
+
     # All conditions met
     return {**base_signal, 'signal_type': 'DIP', 'entry': True,
-            'reason': f'DIP: RSI={rsi:.1f} BTC_3h={btc_3h:+.2f}%'}
+            'reason': f'DIP: RSI={rsi:.1f} BTC_3h={btc_3h:+.2f}% OB={base_signal.get("ob_flow", "n/a")}'}
 
 
 # ─────────────────────────────────────────────

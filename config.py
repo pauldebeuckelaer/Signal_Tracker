@@ -4,9 +4,9 @@ Multi-Coin Signal Tracker — Configuration
 Per-coin strategies with shared infrastructure.
 
 HYPE:  VI + RSI + contrarian flow + BTC gate + OB filter  (full stack)
-VVV:   RSI + BTC gate                                     (simple dip buyer)
-NEAR:  RSI + BTC gate                                     (simple dip buyer)
-PURR:  RSI + BTC gate                                     (simple dip buyer)
+VVV:   RSI + BTC gate + OB flow filter                    (simple dip buyer)
+NEAR:  RSI + BTC gate + OB flow filter                    (simple dip buyer)
+PURR:  RSI + BTC gate + OB flow filter                    (simple dip buyer)
 """
 
 import os
@@ -56,7 +56,17 @@ SNAPSHOT_MIN_TICKS = 10
 # Each coin dict contains all parameters specific to that coin.
 # strategy_type:
 #   "full"   = VI + RSI + contrarian flow + BTC gate + OB filter (HYPE)
-#   "simple" = RSI + BTC gate only (VVV, NEAR, PURR)
+#   "simple" = RSI + BTC gate + OB flow filter (VVV, NEAR, PURR)
+#
+# OB flow filter for simple coins:
+#   ob_flow_enabled:          turn on/off
+#   ob_flow_lookback_minutes: how far back to sum net_aggressor_flow
+#   ob_flow_stale_minutes:    max age before data is considered stale
+#   ob_min_net_flow:          minimum net aggressor flow (coin-unit calibrated)
+#   ob_min_trades:            minimum num_trades in lookback window
+#
+# Cooldown:
+#   cooldown_minutes:         after a TIME exit, don't re-enter this coin for N minutes
 
 COIN_CONFIGS = {
     "HYPE": {
@@ -82,6 +92,9 @@ COIN_CONFIGS = {
         "ob_flow_enabled": True,
         "ob_flow_lookback_minutes": 30,
         "ob_flow_stale_minutes": 5,
+
+        # Cooldown after TIME exit
+        "cooldown_minutes": 30,
     },
 
     "VVV": {
@@ -95,6 +108,17 @@ COIN_CONFIGS = {
         "tp_pct": 3.0,
         "sl_pct": 3.0,
         "max_hold_bars": 6,           # 6 x 30min = 3 hours
+
+        # OB flow filter — calibrated to VVV avg_abs_flow ~457
+        # min_net_flow 100 ≈ 22% of avg_abs_flow (require meaningful buy pressure)
+        "ob_flow_enabled": True,
+        "ob_flow_lookback_minutes": 30,
+        "ob_flow_stale_minutes": 5,
+        "ob_min_net_flow": 100,
+        "ob_min_trades": 5,
+
+        # Cooldown after TIME exit — skip 2 candles
+        "cooldown_minutes": 60,
     },
 
     "NEAR": {
@@ -108,6 +132,17 @@ COIN_CONFIGS = {
         "tp_pct": 1.5,
         "sl_pct": 1.0,
         "max_hold_bars": 6,           # 6 x 30min = 3 hours
+
+        # OB flow filter — calibrated to NEAR avg_abs_flow ~1610
+        # min_net_flow 300 ≈ 19% of avg_abs_flow
+        "ob_flow_enabled": True,
+        "ob_flow_lookback_minutes": 30,
+        "ob_flow_stale_minutes": 5,
+        "ob_min_net_flow": 300,
+        "ob_min_trades": 3,
+
+        # Cooldown after TIME exit — skip 2 candles
+        "cooldown_minutes": 60,
     },
 
     "PURR": {
@@ -121,6 +156,18 @@ COIN_CONFIGS = {
         "tp_pct": 3.0,
         "sl_pct": 3.0,
         "max_hold_bars": 24,          # 24 x 30min = 12 hours
+
+        # OB flow filter — calibrated to PURR avg_abs_flow ~1213
+        # min_net_flow 200 ≈ 16% of avg_abs_flow
+        # min_trades 2 because PURR averages 1.7 trades/min (very thin)
+        "ob_flow_enabled": True,
+        "ob_flow_lookback_minutes": 30,
+        "ob_flow_stale_minutes": 5,
+        "ob_min_net_flow": 200,
+        "ob_min_trades": 2,
+
+        # Cooldown after TIME exit — skip 2 candles
+        "cooldown_minutes": 60,
     },
 }
 

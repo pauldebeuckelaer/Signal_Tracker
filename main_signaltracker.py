@@ -26,6 +26,38 @@ import executor
 
 
 # ─────────────────────────────────────────────
+# COOLDOWN TRACKING
+# ─────────────────────────────────────────────
+# Tracks when each coin last had a TIME exit.
+# Format: { "VVV": datetime, "NEAR": datetime, ... }
+_cooldown_until = {}
+
+
+def _set_cooldown(symbol: str):
+    """Set cooldown for a coin after a TIME exit."""
+    coin_cfg = config.COIN_CONFIGS.get(symbol, {})
+    cooldown_minutes = coin_cfg.get('cooldown_minutes', 0)
+    if cooldown_minutes > 0:
+        until = datetime.now(timezone.utc) + __import__('datetime').timedelta(minutes=cooldown_minutes)
+        _cooldown_until[symbol] = until
+        log.info(f"[{symbol}] Cooldown set: no re-entry until {until.strftime('%H:%M UTC')} ({cooldown_minutes}min)")
+
+
+def _is_on_cooldown(symbol: str) -> bool:
+    """Check if a coin is still in cooldown after a TIME exit."""
+    if symbol not in _cooldown_until:
+        return False
+    now = datetime.now(timezone.utc)
+    if now < _cooldown_until[symbol]:
+        remaining = (_cooldown_until[symbol] - now).total_seconds() / 60
+        log.info(f"[{symbol}] On cooldown, {remaining:.0f}min remaining")
+        return True
+    # Cooldown expired, clean up
+    del _cooldown_until[symbol]
+    return False
+
+
+# ─────────────────────────────────────────────
 # POSITION MANAGEMENT (TP / SL / TIME EXIT)
 # ─────────────────────────────────────────────
 
@@ -85,6 +117,8 @@ def check_exit_conditions():
         if hold_minutes >= max_hold_minutes:
             executor.close_position(symbol,
                 f"TIME exit: held {hold_minutes:.0f}min (max {max_hold_minutes}min), PnL={pnl_pct:+.2f}%")
+            # Set cooldown to prevent immediate re-entry
+            _set_cooldown(symbol)
             continue
 
     save_positions(executor.get_positions())
@@ -105,6 +139,10 @@ def check_all_coins():
         # Skip if already in this coin
         if executor.has_position(symbol):
             log.info(f"[{symbol}] Already in position, skipping")
+            continue
+
+        # Skip if on cooldown after TIME exit
+        if _is_on_cooldown(symbol):
             continue
 
         # Skip if max positions reached
@@ -147,6 +185,8 @@ def check_all_coins():
                     pos['entry_flow'] = signal.get('capped_flow', 0)
                     pos['entry_btc_3h'] = signal['btc_3h_change']
                     pos['strategy_type'] = coin_cfg['strategy_type']
+                    pos['entry_ob_flow'] = signal.get('ob_flow', 0)
+                    pos['entry_ob_trades'] = signal.get('ob_trades', 0)
                     break
             save_positions(positions)
 
@@ -155,6 +195,7 @@ def check_all_coins():
         'coins_checked': config.ENABLED_COINS,
         'positions': len(executor.get_positions()),
         'open_symbols': [p['symbol'] for p in executor.get_positions()],
+        'cooldowns': {sym: until.isoformat() for sym, until in _cooldown_until.items()},
         'timestamp': datetime.now(timezone.utc).isoformat(),
     })
 
@@ -172,9 +213,10 @@ def _log_signal(signal: dict, coin_cfg: dict):
                  f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
                  f"${signal['price']:.4f} | {signal['reason']}")
     else:
+        ob_str = f" OB={signal.get('ob_flow', 'n/a')}/{signal.get('ob_trades', 'n/a')}t" if 'ob_flow' in signal else ""
         log.info(f"[{symbol}] {signal['signal_type']:>8} | "
                  f"RSI={signal['rsi']:.1f} "
-                 f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
+                 f"BTC_3h={signal['btc_3h_change']:+.2f}%{ob_str} | "
                  f"${signal['price']:.4f} | {signal['reason']}")
 
 
@@ -314,7 +356,7 @@ def _get_price(client, symbol: str):
 
 def main():
     log.info("=" * 85)
-    log.info("Multi-Coin Signal Tracker v2.0")
+    log.info("Multi-Coin Signal Tracker v2.1")
     log.info(f"Coins: {', '.join(config.ENABLED_COINS)}")
     log.info(f"Max positions: {config.MAX_POSITIONS} | Size: ${config.FIXED_POSITION_USD} each")
     log.info(f"BTC risk-off gate: 3h change > {config.BTC_3H_CHANGE_MIN}%")
@@ -324,15 +366,21 @@ def main():
     for sym in config.ENABLED_COINS:
         cfg = config.COIN_CONFIGS[sym]
         strategy = cfg['strategy_type']
+        cooldown = cfg.get('cooldown_minutes', 0)
         if strategy == "full":
             log.info(f"  {sym:6s} | {strategy:6s} | VI>{cfg['vi_threshold']} RSI<{cfg['rsi_threshold']} "
                      f"| TP={cfg['tp_pct']}% SL={cfg['sl_pct']}% "
                      f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min) "
-                     f"| OB={cfg.get('ob_flow_enabled', False)}")
+                     f"| OB={cfg.get('ob_flow_enabled', False)} | CD={cooldown}min")
         else:
+            ob_info = ""
+            if cfg.get('ob_flow_enabled', False):
+                ob_info = (f" | OB: flow>={cfg.get('ob_min_net_flow', 0)} "
+                           f"trades>={cfg.get('ob_min_trades', 0)}")
             log.info(f"  {sym:6s} | {strategy:6s} | RSI<{cfg['rsi_threshold']} "
                      f"| TP={cfg['tp_pct']}% SL={cfg['sl_pct']}% "
-                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min)")
+                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min)"
+                     f"{ob_info} | CD={cooldown}min")
     log.info("=" * 85)
 
     # Initialize
