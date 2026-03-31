@@ -166,6 +166,8 @@ def check_all_coins():
             'price': signal['price'],
             'cf_z': signal.get('capped_flow', 0),
             'unique_addresses': signal.get('unique_whales', 0),
+            '_full_signal': signal,
+            '_reason': signal.get('reason', ''),
         }
 
         success = executor.open_position(
@@ -213,10 +215,13 @@ def _log_signal(signal: dict, coin_cfg: dict):
                  f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
                  f"${signal['price']:.4f} | {signal['reason']}")
     else:
-        ob_str = f" OB={signal.get('ob_flow', 'n/a')}/{signal.get('ob_trades', 'n/a')}t" if 'ob_flow' in signal else ""
+        rsi_1h = signal.get('rsi_1h', None)
+        rsi_4h = signal.get('rsi_4h', None)
+        rsi_1h_str = f"{rsi_1h:.1f}" if rsi_1h is not None else "n/a"
+        rsi_4h_str = f"{rsi_4h:.1f}" if rsi_4h is not None else "n/a"
         log.info(f"[{symbol}] {signal['signal_type']:>8} | "
-                 f"RSI={signal['rsi']:.1f} "
-                 f"BTC_3h={signal['btc_3h_change']:+.2f}%{ob_str} | "
+                 f"RSI 30m={signal['rsi']:.1f} 1h={rsi_1h_str} 4h={rsi_4h_str} "
+                 f"BTC_3h={signal['btc_3h_change']:+.2f}% | "
                  f"${signal['price']:.4f} | {signal['reason']}")
 
 
@@ -373,14 +378,11 @@ def main():
                      f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min) "
                      f"| OB={cfg.get('ob_flow_enabled', False)} | CD={cooldown}min")
         else:
-            ob_info = ""
-            if cfg.get('ob_flow_enabled', False):
-                ob_info = (f" | OB: flow>={cfg.get('ob_min_net_flow', 0)} "
-                           f"trades>={cfg.get('ob_min_trades', 0)}")
-            log.info(f"  {sym:6s} | {strategy:6s} | RSI<{cfg['rsi_threshold']} "
+            log.info(f"  {sym:6s} | {strategy:6s} | RSI 30m<{cfg.get('rsi_30m_threshold', '?')} "
+                     f"1h<{cfg.get('rsi_1h_threshold', '?')} 4h<{cfg.get('rsi_4h_threshold', '?')} "
                      f"| TP={cfg['tp_pct']}% SL={cfg['sl_pct']}% "
-                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min)"
-                     f"{ob_info} | CD={cooldown}min")
+                     f"Hold={cfg['max_hold_bars']}bars ({cfg['max_hold_bars'] * config.CANDLE_FREQ_MINUTES}min) "
+                     f"| CD={cooldown}min")
     log.info("=" * 85)
 
     # Initialize

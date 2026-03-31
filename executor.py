@@ -160,10 +160,8 @@ def open_position(symbol: str, direction: str, signal: dict):
                 symbol=symbol,
                 direction=direction,
                 price=price,
-                z=signal["cf_z"],
-                whales=signal["unique_addresses"],
-                activity_ratio=0,  # filled in by caller if available
-                reason=f"z={signal['cf_z']:+.2f}, {signal['unique_addresses']} addrs",
+                signal=signal.get('_full_signal', {}),
+                reason=signal.get('_reason', ''),
             )
             return True
         else:
@@ -227,12 +225,23 @@ def close_position(symbol: str, reason: str = ""):
                 min_price=pos.get("min_price"),
             )
 
+            hold_minutes = 0
+            try:
+                entry_time = datetime.fromisoformat(pos['entry_time'])
+                hold_minutes = (datetime.now(timezone.utc) - entry_time).total_seconds() / 60
+            except Exception:
+                pass
+
+            pnl_usd = pnl_pct / 100 * config.FIXED_POSITION_USD
+
             alerts.exit_alert(
                 symbol=symbol,
                 direction=pos["side"],
                 entry_price=pos["entry_price"],
                 exit_price=current_price or 0,
                 pnl_pct=pnl_pct,
+                pnl_usd=pnl_usd,
+                hold_minutes=hold_minutes,
                 reason=reason,
             )
 
@@ -252,67 +261,6 @@ def close_position(symbol: str, reason: str = ""):
 # ─────────────────────────────────────────────
 # STOP MANAGEMENT
 # ─────────────────────────────────────────────
-
-def check_stops():
-    """
-    Check all positions for stop conditions.
-    Called every minute.
-    """
-    if not _positions:
-        return
-
-    client = get_client()
-
-    for pos in list(_positions):
-        symbol = pos["symbol"]
-        current_price = _get_price(client, symbol)
-
-        if not current_price:
-            log.warning(f"Can't get price for {symbol}, skipping stop check")
-            continue
-
-        entry_price = pos["entry_price"]
-
-        # Update max/min price tracking
-        if current_price > pos.get("max_price", 0):
-            pos["max_price"] = current_price
-        if current_price < pos.get("min_price", float("inf")):
-            pos["min_price"] = current_price
-
-        # PnL
-        if pos["side"] == "long":
-            pnl_pct = (current_price - entry_price) / entry_price * 100
-        else:
-            pnl_pct = (entry_price - current_price) / entry_price * 100
-
-        # Fixed stop
-        if pos["side"] == "long":
-            fixed_stop = entry_price * (1 - config.FIXED_STOP_PCT / 100)
-            if current_price <= fixed_stop:
-                close_position(symbol, f"Fixed stop ${fixed_stop:.4f} (entry ${entry_price:.4f} -{config.FIXED_STOP_PCT}%)")
-                continue
-        else:
-            fixed_stop = entry_price * (1 + config.FIXED_STOP_PCT / 100)
-            if current_price >= fixed_stop:
-                close_position(symbol, f"Fixed stop ${fixed_stop:.4f} (entry ${entry_price:.4f} +{config.FIXED_STOP_PCT}%)")
-                continue
-
-        # Trailing stop (only activates after minimum profit)
-        if pnl_pct >= config.TRAILING_ACTIVATE_PCT:
-            max_price = pos.get("max_price", current_price)
-            if pos["side"] == "long":
-                trail_stop = max_price * (1 - config.TRAILING_STOP_PCT / 100)
-                if current_price <= trail_stop:
-                    close_position(symbol, f"Trail stop ${trail_stop:.4f} (max ${max_price:.4f} -{config.TRAILING_STOP_PCT}%)")
-                    continue
-            else:
-                min_price = pos.get("min_price", current_price)
-                trail_stop = min_price * (1 + config.TRAILING_STOP_PCT / 100)
-                if current_price >= trail_stop:
-                    close_position(symbol, f"Trail stop ${trail_stop:.4f} (min ${min_price:.4f} +{config.TRAILING_STOP_PCT}%)")
-                    continue
-
-    save_positions(_positions)
 
 
 # ─────────────────────────────────────────────

@@ -136,6 +136,51 @@ def _add_indicators(candles: pd.DataFrame, rsi_period: int = 14) -> pd.DataFrame
 
     return d
 
+def _compute_multitf_rsi(conn, symbol: str, rsi_period: int = 14) -> dict:
+    """
+    Compute RSI on 30m, 1h, and 4h timeframes from market_snapshots.
+    Needs ~72h of data for reliable 4h RSI (14 periods x 4h = 56h + buffer).
+    """
+    query = """
+        SELECT snapshot_time, mark_px
+        FROM market_snapshots
+        WHERE coin = ?
+          AND snapshot_time > datetime('now', '-72 hours')
+        ORDER BY snapshot_time
+    """
+    df = pd.read_sql_query(query, conn, params=(symbol,))
+
+    if df.empty:
+        log.warning(f"No market_snapshot data for {symbol} MTF RSI")
+        return {'rsi_30m': None, 'rsi_1h': None, 'rsi_4h': None}
+
+    df['snapshot_time'] = pd.to_datetime(df['snapshot_time'], utc=True)
+    df = df.set_index('snapshot_time')
+
+    result = {}
+
+    for tf_label, tf_rule in [('rsi_30m', '30min'), ('rsi_1h', '1h'), ('rsi_4h', '4h')]:
+        candles = df.resample(tf_rule).agg(
+            close=('mark_px', 'last'),
+            tick_count=('mark_px', 'count'),
+        ).dropna(subset=['close'])
+
+        if len(candles) < rsi_period + 5:
+            log.warning(f"[{symbol}] Not enough {tf_label} candles: {len(candles)}")
+            result[tf_label] = None
+            continue
+
+        delta = candles['close'].diff()
+        gain = delta.clip(lower=0).rolling(rsi_period).mean()
+        loss = (-delta.clip(upper=0)).rolling(rsi_period).mean()
+        rs = gain / loss
+        rsi_series = 100 - (100 / (1 + rs))
+
+        latest_rsi = rsi_series.iloc[-1]
+        result[tf_label] = round(float(latest_rsi), 1) if pd.notna(latest_rsi) else None
+
+    return result
+
 
 # ─────────────────────────────────────────────
 # FLOW CALCULATIONS (HYPE only)
@@ -399,62 +444,55 @@ def _evaluate_full(conn, candles, base_signal: dict, coin_cfg: dict) -> dict:
 
 def _evaluate_simple(conn, base_signal: dict, coin_cfg: dict) -> dict:
     """
-    Simple strategy evaluation (VVV, NEAR, PURR).
-    RSI < threshold + BTC gate + OB flow filter.
-
-    OB flow filter checks:
-      1. Data is not stale
-      2. Net aggressor flow > ob_min_net_flow (coin-calibrated)
-      3. Total trades in lookback > ob_min_trades
+    Simple strategy evaluation (VVV, NEAR).
+    Multi-timeframe RSI confirmation + BTC gate.
+    Requires RSI oversold on ALL three timeframes (30m, 1h, 4h).
     """
     symbol = coin_cfg['symbol']
-    rsi = base_signal['rsi']
-    rsi_threshold = coin_cfg.get('rsi_threshold', 40)
     btc_3h = base_signal['btc_3h_change']
 
-    # Check RSI
-    if rsi >= rsi_threshold:
-        return {**base_signal, 'signal_type': 'NONE', 'entry': False,
-                'reason': f'RSI too high ({rsi:.1f} >= {rsi_threshold})'}
+    # 1. Compute multi-timeframe RSI
+    rsi_period = coin_cfg.get('rsi_period', 14)
+    mtf_rsi = _compute_multitf_rsi(conn, symbol, rsi_period)
 
-    # Check BTC gate
+    rsi_30m = mtf_rsi['rsi_30m']
+    rsi_1h = mtf_rsi['rsi_1h']
+    rsi_4h = mtf_rsi['rsi_4h']
+
+    base_signal['rsi'] = rsi_30m if rsi_30m is not None else 50
+    base_signal['rsi_1h'] = rsi_1h
+    base_signal['rsi_4h'] = rsi_4h
+
+    if any(v is None for v in [rsi_30m, rsi_1h, rsi_4h]):
+        return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                'reason': f'MTF RSI incomplete: 30m={rsi_30m} 1h={rsi_1h} 4h={rsi_4h}'}
+
+    # 2. Get thresholds
+    rsi_30m_threshold = coin_cfg.get('rsi_30m_threshold', 30)
+    rsi_1h_threshold = coin_cfg.get('rsi_1h_threshold', 35)
+    rsi_4h_threshold = coin_cfg.get('rsi_4h_threshold', 40)
+
+    # 3. Check each timeframe (cheapest filter first)
+    if rsi_4h >= rsi_4h_threshold:
+        return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                'reason': f'RSI_4h too high ({rsi_4h:.1f} >= {rsi_4h_threshold})'}
+
+    if rsi_1h >= rsi_1h_threshold:
+        return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                'reason': f'RSI_1h too high ({rsi_1h:.1f} >= {rsi_1h_threshold})'}
+
+    if rsi_30m >= rsi_30m_threshold:
+        return {**base_signal, 'signal_type': 'NONE', 'entry': False,
+                'reason': f'RSI_30m too high ({rsi_30m:.1f} >= {rsi_30m_threshold})'}
+
+    # 4. BTC gate
     if btc_3h <= config.BTC_3H_CHANGE_MIN:
         return {**base_signal, 'signal_type': 'NONE', 'entry': False,
                 'reason': f'BTC risk-off (3h={btc_3h:+.2f}% <= {config.BTC_3H_CHANGE_MIN}%)'}
 
-    # ── OB FLOW FILTER (new) ──
-    if coin_cfg.get('ob_flow_enabled', False):
-        ob = _get_orderbook_flow(conn, symbol, coin_cfg)
-        base_signal['ob_flow'] = round(ob['flow'], 0)
-        base_signal['ob_snapshots'] = ob['count']
-        base_signal['ob_trades'] = ob['total_trades']
-
-        min_net_flow = coin_cfg.get('ob_min_net_flow', 0)
-        min_trades = coin_cfg.get('ob_min_trades', 0)
-
-        if ob['stale']:
-            log.warning(f"[{symbol}] OB data stale (latest: {ob['latest_time']}), blocking entry")
-            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
-                    'reason': f"OB data stale (latest: {ob['latest_time']})"}
-
-        # Check minimum trade activity — is anyone even trading?
-        if ob['total_trades'] < min_trades:
-            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
-                    'reason': f"OB too quiet ({ob['total_trades']} trades < {min_trades} min in {coin_cfg.get('ob_flow_lookback_minutes', 30)}min)"}
-
-        # Check net aggressor flow — are buyers stepping in?
-        if ob['flow'] < min_net_flow:
-            return {**base_signal, 'signal_type': 'NONE', 'entry': False,
-                    'reason': f"OB flow too weak ({ob['flow']:.0f} < {min_net_flow} min in {coin_cfg.get('ob_flow_lookback_minutes', 30)}min)"}
-
-        log.info(f"[{symbol}] OB flow OK: {ob['flow']:.0f} (>={min_net_flow}), "
-                 f"trades={ob['total_trades']} (>={min_trades})")
-
-    # All conditions met
+    # 5. All conditions met
     return {**base_signal, 'signal_type': 'DIP', 'entry': True,
-            'reason': f'DIP: RSI={rsi:.1f} BTC_3h={btc_3h:+.2f}% OB={base_signal.get("ob_flow", "n/a")}'}
-
-
+            'reason': f'MTF_DIP: RSI 30m={rsi_30m:.1f} 1h={rsi_1h:.1f} 4h={rsi_4h:.1f} BTC_3h={btc_3h:+.2f}%'}
 # ─────────────────────────────────────────────
 # LEGACY WRAPPER (backward compatibility)
 # ─────────────────────────────────────────────
